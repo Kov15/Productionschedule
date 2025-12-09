@@ -3,7 +3,6 @@ import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
   signInAnonymously, 
-  signInWithCustomToken, 
   onAuthStateChanged 
 } from 'firebase/auth';
 import { 
@@ -16,9 +15,6 @@ import {
   onSnapshot, 
   query, 
   serverTimestamp, 
-  where,
-  orderBy,
-  runTransaction,
   writeBatch,
   increment,
   getDoc
@@ -31,42 +27,40 @@ import {
   Calculator, 
   Users, 
   Settings, 
-  AlertTriangle, 
   CheckCircle2, 
-  Clock, 
   Menu, 
   X, 
   Trash2,
   Activity,
-  Save,
-  ArrowRight,
   Package,
   Layers
 } from 'lucide-react';
 
-// --- Firebase Configuration ---
-
+// --- PRODUCTION FIREBASE CONFIGURATION ---
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_API_KEY,
-  authDomain: import.meta.env.VITE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_APP_ID
+  apiKey: "AIzaSyDdQaeU2kbxP5aayG22AnytNVIUM6taoqU",
+  authDomain: "productschedule-f0b2b.firebaseapp.com",
+  projectId: "productschedule-f0b2b",
+  storageBucket: "productschedule-f0b2b.firebasestorage.app",
+  messagingSenderId: "539789217888",
+  appId: "1:539789217888:web:e77fc013d94c13f812f305",
+  measurementId: "G-Y7YW14ECN4"
 };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// This defines where your data lives in the database.
-// We use a fixed ID so all your data stays in one place.
-const appId = "aqua-production-v1";
+// FIX: Flatten the database structure to avoid "Invalid collection reference" errors.
+// Instead of "aqua_production/projects", we use "aqua_projects" at the root.
+const COL_PREFIX = 'aqua_';
+
+// Helper to get collection reference safely
+const getColRef = (colName) => collection(db, `${COL_PREFIX}${colName}`);
 
 // --- Types & Default Data ---
 
 const ALL_STEPS_DEFINITIONS = [
-  // Printing Options (Order 1)
   { 
     id: 'printing_screen', 
     name: 'Printing - Screen', 
@@ -85,8 +79,6 @@ const ALL_STEPS_DEFINITIONS = [
     setupTime: 10,
     defaultCapacityMap: JSON.stringify({ "1": 768 }) 
   },
-
-  // Cutting (Order 2)
   { 
     id: 'cutting', 
     name: 'Cutting', 
@@ -96,8 +88,6 @@ const ALL_STEPS_DEFINITIONS = [
     setupTime: 20,
     defaultCapacityMap: JSON.stringify({ "1": 400, "2": 750 }) 
   },
-
-  // Stringing Options (Order 3)
   { 
     id: 'string_machine', 
     name: 'String Machine', 
@@ -116,8 +106,6 @@ const ALL_STEPS_DEFINITIONS = [
     setupTime: 0,
     defaultCapacityMap: JSON.stringify({ "1": 900, "2": 1800, "3": 2700, "4": 3600, "5": 4500 }) 
   },
-
-  // Finishing Steps (Order 4-6)
   { 
     id: 'flowpack', 
     name: 'Flowpack', 
@@ -187,7 +175,6 @@ const getParamValue = (stepId, field, parameters, defaultVal) => {
   return param && param[field] ? param[field] : defaultVal;
 };
 
-// Generates a predictable ID for stock documents: "PaperAirFreshener_printing_screen"
 const getStockId = (productType, stepId) => `${productType.replace(/\s+/g, '')}_${stepId}`;
 
 // --- Components ---
@@ -196,21 +183,33 @@ const App = () => {
   const [user, setUser] = useState(null);
   const [view, setView] = useState('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
+      try {
         await signInAnonymously(auth);
+      } catch (err) {
+        console.error("Auth Error:", err);
+        setError(err.message);
       }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+        if (currentUser) setUser(currentUser);
+    }, (err) => setError(err.message));
     return () => unsubscribe();
   }, []);
 
-  if (!user) return <div className="min-h-screen flex items-center justify-center bg-cyan-50 text-cyan-800">Loading AQUA Scheduler 2.2...</div>;
+  if (error) return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-red-50 text-red-800 p-8 text-center">
+      <h2 className="text-2xl font-bold mb-4">Connection Error</h2>
+      <p className="mb-4">{error}</p>
+      <p className="text-sm text-slate-600">Check your Firebase Auth Settings.</p>
+    </div>
+  );
+
+  if (!user) return <div className="min-h-screen flex items-center justify-center bg-cyan-50 text-cyan-800">Loading AQUA Scheduler 2.5...</div>;
 
   const NavItem = ({ target, icon: Icon, label }) => (
     <button
@@ -226,7 +225,6 @@ const App = () => {
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 flex flex-col md:flex-row">
-      {/* Mobile Header */}
       <div className="md:hidden bg-white p-4 shadow-sm flex justify-between items-center z-20 relative">
         <h1 className="text-xl font-bold text-cyan-700">AQUA Scheduler</h1>
         <button onClick={() => setMobileMenuOpen(!mobileMenuOpen)}>
@@ -234,14 +232,13 @@ const App = () => {
         </button>
       </div>
 
-      {/* Sidebar */}
       <div className={`
         fixed inset-y-0 left-0 transform ${mobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}
         md:relative md:translate-x-0 transition duration-200 ease-in-out
         w-64 bg-white border-r border-slate-200 flex flex-col z-10 shadow-xl md:shadow-none
       `}>
         <div className="p-6 border-b border-slate-100 hidden md:block">
-          <h1 className="text-2xl font-extrabold text-cyan-600 tracking-tight">AQUA<span className="text-slate-400 text-sm block font-normal">Production v2.2</span></h1>
+          <h1 className="text-2xl font-extrabold text-cyan-600 tracking-tight">AQUA<span className="text-slate-400 text-sm block font-normal">Production v2.5</span></h1>
         </div>
         
         <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
@@ -262,7 +259,6 @@ const App = () => {
         </div>
       </div>
 
-      {/* Main Content */}
       <main className="flex-1 p-4 md:p-8 overflow-y-auto h-screen bg-slate-50">
         <div className="max-w-6xl mx-auto">
           {view === 'dashboard' && <Dashboard user={user} setView={setView} />}
@@ -287,12 +283,15 @@ const useCollection = (collectionName, user) => {
 
   useEffect(() => {
     if (!user) return;
-    const q = collection(db, 'artifacts', appId, 'public', 'data', collectionName);
+    // FIX: Using the helper to ensure correct path (aqua_projects, etc.)
+    const q = getColRef(collectionName);
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setData(items);
       setLoading(false);
-    }, (err) => console.error(err));
+    }, (err) => {
+        console.error("Collection Error:", err);
+    });
     return () => unsubscribe();
   }, [user, collectionName]);
 
@@ -303,14 +302,13 @@ const useCollection = (collectionName, user) => {
 
 const Dashboard = ({ user, setView }) => {
   const { data: projects } = useCollection('projects', user);
-  const { data: parameters } = useCollection('parameters', user);
   const { data: stocks } = useCollection('step_stocks', user);
   
   const activeProjects = projects.filter(p => p.status !== 'Completed' && p.status !== 'Cancelled');
 
   const handleDelete = async (projectId) => {
     if (confirm('Are you sure you want to delete this project? This cannot be undone.')) {
-      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', projectId));
+      await deleteDoc(doc(db, `${COL_PREFIX}projects`, projectId));
     }
   };
 
@@ -341,7 +339,7 @@ const Dashboard = ({ user, setView }) => {
       {/* Stock Ticker */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
         <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wide mb-3 flex items-center gap-2">
-          <Layers size={14} /> Global Semi-Finished Stock (Available to skip steps)
+          <Layers size={14} /> Global Semi-Finished Stock (History)
         </h3>
         <div className="flex gap-4 overflow-x-auto pb-2">
           {stocks.length === 0 && <span className="text-sm text-slate-400">No stock recorded yet.</span>}
@@ -397,7 +395,7 @@ const Dashboard = ({ user, setView }) => {
                          <div className="flex justify-between items-end">
                             <span className="text-sm font-bold text-slate-800">{stepPct}%</span>
                             {stockUsed > 0 && (
-                              <span className="text-[10px] text-amber-600 bg-amber-50 px-1 rounded" title={`Stock used: ${stockUsed}`}>Stock: {stockUsed}</span>
+                              <span className="text-[10px] text-amber-600 bg-amber-50 px-1 rounded" title={`Stock used: ${stockUsed}`}>Init: {stockUsed}</span>
                             )}
                          </div>
                          <div className="w-full bg-slate-200 rounded-full h-1.5 mt-2">
@@ -448,9 +446,7 @@ const NewProject = ({ user, setView }) => {
     notes: ''
   });
   
-  // Track stock usage for the current setup
   const [stockAllocation, setStockAllocation] = useState({});
-
   const [loading, setLoading] = useState(false);
 
   const relevantSteps = useMemo(() => 
@@ -458,14 +454,10 @@ const NewProject = ({ user, setView }) => {
   [formData.printingMethod, formData.hangingMethod]);
 
   const handleStockChange = (stepId, val) => {
-    // Cannot exceed target or available stock
-    const stockKey = getStockId(formData.type, stepId);
-    const available = stocks.find(s => s.id === stockKey)?.quantity || 0;
-    const max = Math.min(available, Number(formData.target));
-    
+    // Manual Stock Entry
+    const max = Number(formData.target);
     let safeVal = Math.min(Number(val), max);
     safeVal = Math.max(0, safeVal);
-
     setStockAllocation(prev => ({...prev, [stepId]: safeVal}));
   };
 
@@ -477,7 +469,6 @@ const NewProject = ({ user, setView }) => {
     try {
       const batch = writeBatch(db);
 
-      // 1. Prepare Initial Progress
       const initialProgress = {};
       ALL_STEPS_DEFINITIONS.forEach(step => {
         const used = stockAllocation[step.id] || 0;
@@ -488,17 +479,8 @@ const NewProject = ({ user, setView }) => {
         };
       });
 
-      // 2. Decrement Stocks used
-      Object.entries(stockAllocation).forEach(([stepId, quantity]) => {
-        if (quantity > 0) {
-          const stockKey = getStockId(formData.type, stepId);
-          const stockRef = doc(db, 'artifacts', appId, 'public', 'data', 'step_stocks', stockKey);
-          batch.update(stockRef, { quantity: increment(-quantity) });
-        }
-      });
-
-      // 3. Create Project
-      const projectRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'projects'));
+      // FIX: Use simple prefixed collection
+      const projectRef = doc(getColRef('projects'));
       batch.set(projectRef, {
         ...formData,
         targetQuantity: Number(formData.target),
@@ -539,7 +521,7 @@ const NewProject = ({ user, setView }) => {
               value={formData.type}
               onChange={e => {
                 setFormData({...formData, type: e.target.value});
-                setStockAllocation({}); // Reset allocation on type change
+                setStockAllocation({});
               }}
             >
               {PRODUCT_TYPES.map(t => <option key={t}>{t}</option>)}
@@ -580,29 +562,29 @@ const NewProject = ({ user, setView }) => {
            </div>
         </div>
 
-        {/* Stock Allocation Section */}
+        {/* Manual Stock Allocation Section */}
         <div className="bg-amber-50 p-4 rounded-lg border border-amber-100">
           <h3 className="text-sm font-bold text-amber-900 mb-3 flex items-center gap-2">
-            <Package size={16} /> Allocate Semi-Finished Stock
+            <Package size={16} /> Enter Pre-Existing Stock (Manual Entry)
           </h3>
+          <p className="text-xs text-amber-800 mb-3">
+             If you already have finished pieces for any step, enter the amount below. This will not affect the history database.
+          </p>
           <div className="space-y-3">
             {relevantSteps.map(step => {
-               const stockKey = getStockId(formData.type, step.id);
-               const available = stocks.find(s => s.id === stockKey)?.quantity || 0;
-               const allocated = stockAllocation[step.id] || 0;
+               const allocated = stockAllocation[step.id] || '';
                
                return (
                  <div key={step.id} className="flex justify-between items-center text-sm">
-                    <span className="text-amber-800">{step.name} <span className="text-amber-600/70 text-xs">(Avail: {available})</span></span>
+                    <span className="text-amber-800 font-medium">{step.name}</span>
                     <input 
                       type="number"
                       min="0"
-                      max={Math.min(available, formData.target)}
-                      className="w-24 p-1 border border-amber-200 rounded text-right"
+                      max={formData.target}
+                      className="w-32 p-1 border border-amber-200 rounded text-right"
                       value={allocated}
                       onChange={e => handleStockChange(step.id, e.target.value)}
                       placeholder="0"
-                      disabled={available === 0}
                     />
                  </div>
                )
@@ -716,7 +698,8 @@ const DailyPlanning = ({ user, setView }) => {
     if (!selectedProject) return;
     try {
       const batchDate = new Date().toISOString().split('T')[0];
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'daily_plans'), {
+      // FIX: Use simple prefixed collection
+      await addDoc(getColRef('daily_plans'), {
         projectId: selectedProjectId,
         date: batchDate,
         assignments: assignments,
@@ -903,13 +886,11 @@ const RecordOutput = ({ user, setView }) => {
   });
 
   const selectedProject = projects.find(p => p.id === form.projectId);
-  // Dynamically load steps based on the project selected in the form
   const availableSteps = selectedProject 
     ? getProjectSteps(selectedProject.printingMethod, selectedProject.hangingMethod) 
     : [];
 
   useEffect(() => {
-    // Reset step ID when project changes to prevent mismatch
     if (availableSteps.length > 0) {
       setForm(prev => ({ ...prev, stepId: availableSteps[0].id }));
     }
@@ -936,7 +917,8 @@ const RecordOutput = ({ user, setView }) => {
       const batch = writeBatch(db);
 
       // 1. Update Project Progress
-      const projectRef = doc(db, 'artifacts', appId, 'public', 'data', 'projects', form.projectId);
+      // FIX: Use simple prefixed collection
+      const projectRef = doc(db, `${COL_PREFIX}projects`, form.projectId);
       batch.update(projectRef, {
         [`progress.${form.stepId}.completed`]: newCompleted,
         [`progress.${form.stepId}.lastUpdate`]: serverTimestamp()
@@ -944,8 +926,7 @@ const RecordOutput = ({ user, setView }) => {
 
       // 2. Increment Stock for future use
       const stockKey = getStockId(project.type, form.stepId);
-      const stockRef = doc(db, 'artifacts', appId, 'public', 'data', 'step_stocks', stockKey);
-      // We use set with merge true to handle case where stock doc doesn't exist yet
+      const stockRef = doc(db, `${COL_PREFIX}step_stocks`, stockKey);
       batch.set(stockRef, { 
         productType: project.type,
         stepId: form.stepId,
@@ -954,7 +935,7 @@ const RecordOutput = ({ user, setView }) => {
       }, { merge: true });
 
       // 3. Add Production Log
-      const logRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'daily_logs'));
+      const logRef = doc(getColRef('daily_logs'));
       batch.set(logRef, {
         ...form,
         projectName: project.name,
@@ -968,7 +949,7 @@ const RecordOutput = ({ user, setView }) => {
       const stepName = availableSteps.find(s => s.id === form.stepId)?.name || form.stepId;
       
       form.workersUsed.forEach(workerId => {
-        const actRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'worker_activities'));
+        const actRef = doc(getColRef('worker_activities'));
         batch.set(actRef, {
           workerId,
           projectId: form.projectId,
@@ -1176,9 +1157,10 @@ const SettingsScreen = ({ user }) => {
     
     try {
       if (existingId) {
-        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'parameters', existingId), editForm);
+        // FIX: Use simple prefixed collection
+        await updateDoc(doc(db, `${COL_PREFIX}parameters`, existingId), editForm);
       } else {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'parameters'), editForm);
+        await addDoc(getColRef('parameters'), editForm);
       }
       setEditingId(null);
     } catch(e) {
@@ -1370,7 +1352,8 @@ const WorkerManager = ({ user }) => {
   const addWorker = async (e) => {
     e.preventDefault();
     if(!form.name) return;
-    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'workers'), form);
+    // FIX: Use simple prefixed collection
+    await addDoc(getColRef('workers'), form);
     setForm({...form, name: ''});
   };
 
