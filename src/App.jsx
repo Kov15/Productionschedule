@@ -33,7 +33,9 @@ import {
   Trash2,
   Activity,
   Package,
-  Layers
+  Layers,
+  AlertOctagon,
+  Clock
 } from 'lucide-react';
 
 // --- PRODUCTION FIREBASE CONFIGURATION ---
@@ -51,20 +53,19 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// FIX: Flatten the database structure to avoid "Invalid collection reference" errors.
-// Instead of "aqua_production/projects", we use "aqua_projects" at the root.
+const DB_PREFIX = 'aqua_production';
 const COL_PREFIX = 'aqua_';
-
-// Helper to get collection reference safely
 const getColRef = (colName) => collection(db, `${COL_PREFIX}${colName}`);
 
 // --- Types & Default Data ---
 
+// Added 'dependsOn' field to track material flow
 const ALL_STEPS_DEFINITIONS = [
   { 
     id: 'printing_screen', 
     name: 'Printing - Screen', 
     order: 1, 
+    dependsOn: null,
     minWorkers: 1,
     maxWorkers: 2,
     setupTime: 20,
@@ -74,6 +75,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'printing_uv', 
     name: 'Printing - UV', 
     order: 1, 
+    dependsOn: null,
     minWorkers: 1,
     maxWorkers: 1,
     setupTime: 10,
@@ -83,6 +85,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'cutting', 
     name: 'Cutting', 
     order: 2, 
+    dependsOn: ['printing_screen', 'printing_uv'], // Can come from either
     minWorkers: 1,
     maxWorkers: 2,
     setupTime: 20,
@@ -92,6 +95,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'string_machine', 
     name: 'String Machine', 
     order: 3, 
+    dependsOn: ['cutting'],
     minWorkers: 1,
     maxWorkers: 1,
     setupTime: 10,
@@ -101,6 +105,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'hanger_manual', 
     name: 'Hanger (Manual)', 
     order: 3, 
+    dependsOn: ['cutting'],
     minWorkers: 1,
     maxWorkers: 5,
     setupTime: 0,
@@ -110,6 +115,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'flowpack', 
     name: 'Flowpack', 
     order: 4, 
+    dependsOn: ['string_machine', 'hanger_manual'],
     minWorkers: 2,
     maxWorkers: 4,
     setupTime: 45,
@@ -119,6 +125,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'syraptiko', 
     name: 'Syraptiko', 
     order: 5, 
+    dependsOn: ['flowpack'],
     minWorkers: 1,
     maxWorkers: 3,
     setupTime: 10,
@@ -128,6 +135,7 @@ const ALL_STEPS_DEFINITIONS = [
     id: 'final_packing', 
     name: 'Final Packing', 
     order: 6, 
+    dependsOn: ['syraptiko'],
     minWorkers: 1,
     maxWorkers: 4,
     setupTime: 10,
@@ -176,6 +184,40 @@ const getParamValue = (stepId, field, parameters, defaultVal) => {
 };
 
 const getStockId = (productType, stepId) => `${productType.replace(/\s+/g, '')}_${stepId}`;
+
+// Calculate Available Input: (Predecessor Completed + Predecessor Stock) - Current Step Completed
+// Returns Infinity if no dependency
+const calculateAvailableInput = (project, stepId, allStocks) => {
+  const stepDef = ALL_STEPS_DEFINITIONS.find(s => s.id === stepId);
+  if (!stepDef || !stepDef.dependsOn) return Number.MAX_SAFE_INTEGER;
+
+  const currentCompleted = project.progress?.[stepId]?.completed || 0;
+  const currentStockUsed = project.progress?.[stepId]?.stockUsed || 0;
+  
+  // Find valid predecessors that are active in this project
+  const predecessors = stepDef.dependsOn;
+  
+  // Calculate total produced by relevant predecessors
+  let totalUpstream = 0;
+  
+  predecessors.forEach(predId => {
+    // Only count if this predecessor is actually part of the project flow?
+    // Simplified: Check if progress exists for it.
+    const predCompleted = project.progress?.[predId]?.completed || 0;
+    const predStockUsed = project.progress?.[predId]?.stockUsed || 0;
+    // Also include global stock for this predecessor step
+    // Note: Global stock is usually consumed when starting a project, but let's check current avail
+    const stockKey = getStockId(project.type, predId);
+    const globalStock = allStocks.find(s => s.id === stockKey)?.quantity || 0;
+
+    totalUpstream += (predCompleted + predStockUsed + globalStock);
+  });
+
+  // Available = Total Upstream Output - What we have already processed in this step
+  // Note: This logic assumes 1:1 ratio.
+  const available = Math.max(0, totalUpstream - (currentCompleted + currentStockUsed));
+  return available;
+};
 
 // --- Components ---
 
@@ -283,7 +325,6 @@ const useCollection = (collectionName, user) => {
 
   useEffect(() => {
     if (!user) return;
-    // FIX: Using the helper to ensure correct path (aqua_projects, etc.)
     const q = getColRef(collectionName);
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -389,9 +430,16 @@ const Dashboard = ({ user, setView }) => {
                      const stockUsed = project.progress?.[step.id]?.stockUsed || 0;
                      const stepPct = Math.min(100, Math.round((completed / project.targetQuantity) * 100));
                      
+                     // Dependency Check for Dashboard Viz
+                     const inputAvail = calculateAvailableInput(project, step.id, stocks);
+                     const isBlocked = inputAvail <= 0 && project.targetQuantity > completed;
+
                      return (
-                       <div key={step.id} className="bg-slate-50 p-3 rounded-lg border border-slate-100">
-                         <div className="text-xs font-semibold text-slate-600 truncate mb-1">{step.name}</div>
+                       <div key={step.id} className={`p-3 rounded-lg border ${isBlocked ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-100'}`}>
+                         <div className="text-xs font-semibold text-slate-600 truncate mb-1 flex items-center justify-between">
+                            {step.name}
+                            {isBlocked && <AlertOctagon size={12} className="text-red-500" />}
+                         </div>
                          <div className="flex justify-between items-end">
                             <span className="text-sm font-bold text-slate-800">{stepPct}%</span>
                             {stockUsed > 0 && (
@@ -479,7 +527,6 @@ const NewProject = ({ user, setView }) => {
         };
       });
 
-      // FIX: Use simple prefixed collection
       const projectRef = doc(getColRef('projects'));
       batch.set(projectRef, {
         ...formData,
@@ -624,73 +671,81 @@ const NewProject = ({ user, setView }) => {
   );
 };
 
+// --- DAILY PLANNING (RE-WRITTEN FOR REALLOCATION LOGIC) ---
 const DailyPlanning = ({ user, setView }) => {
   const { data: projects } = useCollection('projects', user);
   const { data: workers } = useCollection('workers', user);
   const { data: parameters } = useCollection('parameters', user);
+  const { data: stocks } = useCollection('step_stocks', user);
   
-  const [step, setStep] = useState(1);
   const [selectedProjectId, setSelectedProjectId] = useState('');
-  const [totalWorkers, setTotalWorkers] = useState(0);
-  const [assignments, setAssignments] = useState({});
-  const [assignmentNotes, setAssignmentNotes] = useState('');
-
+  
+  // Track assignments: { workerId: [ {stepId, hours} ] }
+  const [assignments, setAssignments] = useState({}); 
+  
   const selectedProject = projects.find(p => p.id === selectedProjectId);
   
-  const applicableSteps = useMemo(() => {
+  // Available steps
+  const activeSteps = useMemo(() => {
     if(!selectedProject) return [];
-    const all = getProjectSteps(selectedProject.printingMethod, selectedProject.hangingMethod);
-    // FILTER: Only show steps that still have remaining work > 0
-    return all.filter(s => {
-       const done = selectedProject.progress?.[s.id]?.completed || 0;
-       return (selectedProject.targetQuantity - done) > 0;
-    });
+    return getProjectSteps(selectedProject.printingMethod, selectedProject.hangingMethod);
   }, [selectedProject]);
 
+  // Initializing assignments structure
   useEffect(() => {
-    if (selectedProjectId) {
+    if (workers.length > 0) {
       const init = {};
-      applicableSteps.forEach(s => init[s.id] = 0);
+      workers.forEach(w => init[w.id] = []);
       setAssignments(init);
     }
-  }, [selectedProjectId, applicableSteps]);
+  }, [workers]);
 
-  const handleAssign = (stepId, delta) => {
-    const current = assignments[stepId] || 0;
-    const newVal = Math.max(0, current + delta);
-    const currentTotal = Object.values(assignments).reduce((a, b) => a + b, 0);
-    if (delta > 0 && currentTotal >= totalWorkers) {
-      alert("No more available workers!");
-      return;
-    }
-    const stepDef = ALL_STEPS_DEFINITIONS.find(s => s.id === stepId);
-    const max = getParamValue(stepId, 'maxWorkers', parameters, stepDef.maxWorkers);
-    if (newVal > max) {
-      alert(`Max workers for ${stepDef.name} is ${max}`);
-      return;
-    }
-    setAssignments(prev => ({ ...prev, [stepId]: newVal }));
+  const getWorkerHoursUsed = (workerId) => {
+    const tasks = assignments[workerId] || [];
+    return tasks.reduce((sum, t) => sum + Number(t.hours), 0);
   };
 
-  const calculateEstimates = () => {
-    return applicableSteps.map(s => {
-      const assigned = assignments[s.id] || 0;
-      const capacity = getCapacityForWorkers(s, assigned, parameters);
-      const remaining = selectedProject ? selectedProject.targetQuantity - (selectedProject.progress?.[s.id]?.completed || 0) : 0;
-      const hoursNeeded = capacity > 0 ? (remaining / capacity).toFixed(1) : (remaining > 0 ? '∞' : 0);
-      
-      const start = new Date();
-      start.setHours(8, 0, 0, 0);
-      const end = new Date(start.getTime() + (capacity > 0 ? (remaining/capacity)*3600000 : 0));
+  const handleAddAssignment = (workerId, stepId, hours) => {
+    const currentHours = getWorkerHoursUsed(workerId);
+    if (currentHours + Number(hours) > 8) {
+      alert("Worker cannot exceed 8 hours per day!");
+      return;
+    }
+    
+    // Skill Check
+    const worker = workers.find(w => w.id === workerId);
+    const stepDef = ALL_STEPS_DEFINITIONS.find(s => s.id === stepId);
+    
+    // Simple skill check: assume 'skills' array on worker. If empty/undefined, assume 'General'.
+    const workerSkills = worker.skills || ['General'];
+    // For MVP, if skill is 'General', allow most things except specialized? 
+    // Or strictly match step name? Let's check if step name is roughly in skills.
+    // If user requested Strict Skill Constraint, we enforce it.
+    // Assuming skills are mapped to step IDs or Names.
+    // If workerSkills is ['General'] and step is 'printing_screen', we might warn.
+    // Let's implement loose matching for now or simple "Printing" matches "Printing - Screen"
+    
+    // For this update, we will assume if worker has NO specific skill, they can't do Printing/Cutting.
+    // But if skills list is empty, we allow all (MVP fallback).
+    if (workerSkills.length > 0 && !workerSkills.includes('General')) {
+       // Check if any skill matches the step ID roughly
+       const hasSkill = workerSkills.some(skill => stepDef.name.toLowerCase().includes(skill.toLowerCase()) || stepDef.id.includes(skill.toLowerCase()));
+       if (!hasSkill) {
+         if (!confirm(`Warning: ${worker.name} does not have skill for ${stepDef.name}. Assign anyway?`)) return;
+       }
+    }
 
-      return {
-        ...s,
-        assigned,
-        capacity,
-        remaining,
-        hoursNeeded,
-        endTime: end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
+    setAssignments(prev => ({
+      ...prev,
+      [workerId]: [...(prev[workerId] || []), { stepId, hours: Number(hours) }]
+    }));
+  };
+
+  const removeAssignment = (workerId, index) => {
+    setAssignments(prev => {
+      const newTasks = [...prev[workerId]];
+      newTasks.splice(index, 1);
+      return { ...prev, [workerId]: newTasks };
     });
   };
 
@@ -698,12 +753,10 @@ const DailyPlanning = ({ user, setView }) => {
     if (!selectedProject) return;
     try {
       const batchDate = new Date().toISOString().split('T')[0];
-      // FIX: Use simple prefixed collection
       await addDoc(getColRef('daily_plans'), {
         projectId: selectedProjectId,
         date: batchDate,
         assignments: assignments,
-        notes: assignmentNotes,
         createdAt: serverTimestamp()
       });
       alert('Daily Plan Saved!');
@@ -714,155 +767,111 @@ const DailyPlanning = ({ user, setView }) => {
     }
   };
 
-  const estimates = calculateEstimates();
-
   return (
-    <div className="max-w-4xl mx-auto space-y-8">
+    <div className="max-w-6xl mx-auto space-y-8">
       <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold text-slate-800">Daily Planning Wizard</h2>
-        <div className="text-sm text-slate-500">Step {step} of 3</div>
+        <h2 className="text-2xl font-bold text-slate-800">Dynamic Daily Planning</h2>
       </div>
 
-      {step === 1 && (
-        <div className="bg-white p-8 rounded-xl shadow-sm border border-slate-200 space-y-6">
-          <h3 className="text-lg font-semibold">1. Setup Day</h3>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Select Project</label>
-            <select 
-              className="w-full p-3 border border-slate-300 rounded-lg"
-              value={selectedProjectId}
-              onChange={e => setSelectedProjectId(e.target.value)}
-            >
-              <option value="">-- Choose Active Project --</option>
-              {projects.filter(p => p.status !== 'Completed').map(p => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Total Workers Available Today</label>
-            <input 
-              type="number" 
-              className="w-full p-3 border border-slate-300 rounded-lg"
-              value={totalWorkers}
-              onChange={e => setTotalWorkers(Number(e.target.value))}
-            />
-          </div>
-          <button 
-            disabled={!selectedProjectId || totalWorkers < 1}
-            onClick={() => setStep(2)}
-            className="w-full py-3 bg-cyan-600 text-white rounded-lg font-medium disabled:opacity-50"
-          >
-            Next: Assign Workers
-          </button>
-        </div>
-      )}
+      <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+        <label className="block text-sm font-bold text-slate-700 mb-2">Select Project to Plan</label>
+        <select 
+          className="w-full p-3 border border-slate-300 rounded-lg"
+          value={selectedProjectId}
+          onChange={e => setSelectedProjectId(e.target.value)}
+        >
+          <option value="">-- Choose Active Project --</option>
+          {projects.filter(p => p.status !== 'Completed').map(p => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+      </div>
 
-      {step === 2 && (
-        <div className="space-y-6">
-           {applicableSteps.length === 0 ? (
-             <div className="bg-emerald-50 p-6 rounded-lg text-emerald-800 text-center">
-               <CheckCircle2 className="mx-auto mb-2" />
-               <p className="font-bold">No steps require work!</p>
-               <p className="text-sm">Stock or previous work has completed all steps for this project.</p>
-               <button onClick={() => setView('dashboard')} className="mt-4 text-emerald-700 underline">Return to Dashboard</button>
-             </div>
-           ) : (
-             <>
-             <div className="bg-cyan-50 border border-cyan-100 p-4 rounded-lg flex justify-between items-center">
-               <span className="font-semibold text-cyan-900">Available Workers: {totalWorkers - Object.values(assignments).reduce((a,b)=>a+b,0)} remaining</span>
-               <button onClick={() => setStep(1)} className="text-sm text-cyan-700 underline">Change Total</button>
-             </div>
+      {selectedProject && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* LEFT: Project Status & Needs */}
+          <div className="space-y-4">
+             <h3 className="font-bold text-lg text-slate-700">Production Needs</h3>
+             {activeSteps.map(step => {
+                const avail = calculateAvailableInput(selectedProject, step.id, stocks);
+                const remaining = selectedProject.targetQuantity - (selectedProject.progress?.[step.id]?.completed || 0);
+                const isBlocked = avail <= 0 && remaining > 0;
 
-             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-               {applicableSteps.map(s => {
-                 const assigned = assignments[s.id] || 0;
-                 const min = getParamValue(s.id, 'minWorkers', parameters, s.minWorkers);
-                 const max = getParamValue(s.id, 'maxWorkers', parameters, s.maxWorkers);
-                 const capacity = getCapacityForWorkers(s, assigned, parameters);
-                 const remaining = selectedProject ? selectedProject.targetQuantity - (selectedProject.progress?.[s.id]?.completed || 0) : 0;
-
-                 return (
-                   <div key={s.id} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-                     <div className="flex justify-between items-start mb-4">
-                       <div>
-                         <h4 className="font-bold text-slate-800">{s.name}</h4>
-                         <p className="text-xs text-slate-500 mb-1">Remaining: {remaining.toLocaleString()}</p>
-                         <p className="text-xs text-slate-400">Min: {min} | Max: {max}</p>
-                       </div>
-                       <div className="text-right">
-                         <div className="text-sm font-mono text-cyan-600 font-bold">{capacity} units/hr</div>
-                       </div>
-                     </div>
-                     
-                     <div className="flex items-center gap-4">
-                       <button onClick={() => handleAssign(s.id, -1)} className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center hover:bg-slate-200">-</button>
-                       <span className="text-xl font-bold w-8 text-center">{assigned}</span>
-                       <button onClick={() => handleAssign(s.id, 1)} className="w-8 h-8 rounded-full bg-cyan-100 text-cyan-700 flex items-center justify-center hover:bg-cyan-200">+</button>
-                     </div>
-                   </div>
-                 );
-               })}
-             </div>
-             
-             <div className="flex gap-4">
-               <button onClick={() => setStep(1)} className="px-6 py-3 bg-white border border-slate-300 rounded-lg">Back</button>
-               <button onClick={() => setStep(3)} className="flex-1 py-3 bg-cyan-600 text-white rounded-lg font-medium">Next: Review Plan</button>
-             </div>
-             </>
-           )}
-        </div>
-      )}
-
-      {step === 3 && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-            <table className="w-full text-sm text-left">
-              <thead className="bg-slate-50 text-slate-600 font-semibold border-b">
-                <tr>
-                  <th className="p-4">Step</th>
-                  <th className="p-4">Workers</th>
-                  <th className="p-4">Capacity/Hr</th>
-                  <th className="p-4">Rem. Qty</th>
-                  <th className="p-4">Est. Hours</th>
-                  <th className="p-4">Est. Finish</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {estimates.map(row => (
-                  <tr key={row.id} className={row.remaining > 0 && Number(row.hoursNeeded) > 8 ? "bg-red-50" : ""}>
-                    <td className="p-4 font-medium">{row.name}</td>
-                    <td className="p-4 font-bold">{row.assigned}</td>
-                    <td className="p-4 text-slate-500">{row.capacity}</td>
-                    <td className="p-4">{row.remaining}</td>
-                    <td className="p-4 font-mono">{row.hoursNeeded}</td>
-                    <td className="p-4">{row.endTime}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                return (
+                  <div key={step.id} className={`p-4 rounded-lg border ${isBlocked ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`}>
+                    <div className="flex justify-between font-bold text-slate-700">
+                      <span>{step.name}</span>
+                      {isBlocked && <span className="text-red-600 text-xs flex items-center gap-1"><AlertOctagon size={14}/> Input Missing</span>}
+                    </div>
+                    <div className="flex justify-between text-sm mt-2 text-slate-500">
+                      <span>Remaining: {remaining.toLocaleString()}</span>
+                      <span>Avail. Input: {avail === Number.MAX_SAFE_INTEGER ? 'Unlimited' : avail.toLocaleString()}</span>
+                    </div>
+                  </div>
+                )
+             })}
           </div>
 
-          <div className="bg-amber-50 p-4 rounded-lg border border-amber-100 text-amber-800 text-sm">
-             <strong>Bottleneck Analysis:</strong>
-             <ul className="list-disc ml-5 mt-2 space-y-1">
-               {estimates.some(e => Number(e.hoursNeeded) > 8) && <li>Some steps will take longer than 8 hours. Consider adding overtime or shifting workers.</li>}
-             </ul>
-          </div>
+          {/* RIGHT: Worker Allocation */}
+          <div className="space-y-4">
+            <h3 className="font-bold text-lg text-slate-700">Worker Allocation (8h Max)</h3>
+            <div className="space-y-4">
+              {workers.map(worker => {
+                const used = getWorkerHoursUsed(worker.id);
+                const free = 8 - used;
+                
+                return (
+                  <div key={worker.id} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                    <div className="flex justify-between items-center mb-3">
+                      <div>
+                        <div className="font-bold text-slate-800">{worker.name}</div>
+                        <div className="text-xs text-slate-400">Skills: {worker.skills?.join(', ') || 'General'}</div>
+                      </div>
+                      <div className={`text-xs font-bold px-2 py-1 rounded ${free === 0 ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+                        {free}h Free
+                      </div>
+                    </div>
 
-          <div>
-             <label className="block text-sm font-medium text-slate-700 mb-2">Planning Notes</label>
-             <textarea 
-               className="w-full p-3 border border-slate-300 rounded-lg"
-               placeholder="e.g., John leaving early, prioritize Flowpack..."
-               value={assignmentNotes}
-               onChange={e => setAssignmentNotes(e.target.value)}
-             />
-          </div>
+                    {/* Assigned Tasks List */}
+                    <div className="space-y-2 mb-3">
+                      {assignments[worker.id]?.map((task, idx) => {
+                         const sName = ALL_STEPS_DEFINITIONS.find(s => s.id === task.stepId)?.name;
+                         return (
+                           <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 p-2 rounded">
+                             <span>{sName} ({task.hours}h)</span>
+                             <button onClick={() => removeAssignment(worker.id, idx)} className="text-red-400 hover:text-red-600"><X size={14} /></button>
+                           </div>
+                         )
+                      })}
+                    </div>
 
-          <div className="flex gap-4">
-             <button onClick={() => setStep(2)} className="px-6 py-3 bg-white border border-slate-300 rounded-lg">Adjust Assignments</button>
-             <button onClick={savePlan} className="flex-1 py-3 bg-emerald-600 text-white rounded-lg font-medium shadow hover:bg-emerald-700">Confirm & Save Plan</button>
+                    {/* Add Task Control */}
+                    {free > 0 && (
+                      <div className="flex gap-2">
+                        <select id={`step-${worker.id}`} className="flex-1 text-xs p-1 border rounded">
+                          {activeSteps.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                        </select>
+                        <input id={`hours-${worker.id}`} type="number" min="1" max={free} placeholder="Hrs" className="w-12 text-xs p-1 border rounded" />
+                        <button 
+                          onClick={() => {
+                            const sEl = document.getElementById(`step-${worker.id}`);
+                            const hEl = document.getElementById(`hours-${worker.id}`);
+                            if(sEl && hEl && hEl.value) handleAddAssignment(worker.id, sEl.value, hEl.value);
+                          }}
+                          className="bg-cyan-600 text-white text-xs px-2 rounded"
+                        >
+                          +
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            
+            <button onClick={savePlan} className="w-full py-3 bg-emerald-600 text-white font-bold rounded-lg shadow mt-6">
+              Confirm Daily Plan
+            </button>
           </div>
         </div>
       )}
@@ -873,6 +882,8 @@ const DailyPlanning = ({ user, setView }) => {
 const RecordOutput = ({ user, setView }) => {
   const { data: projects } = useCollection('projects', user);
   const { data: workers } = useCollection('workers', user);
+  const { data: stocks } = useCollection('step_stocks', user);
+  
   const activeProjects = projects.filter(p => p.status !== 'Completed');
 
   const [form, setForm] = useState({
@@ -896,13 +907,19 @@ const RecordOutput = ({ user, setView }) => {
     }
   }, [selectedProject]);
 
-
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!form.projectId || !form.quantity) return;
 
-    const project = projects.find(p => p.id === form.projectId);
-    const currentCompleted = project.progress?.[form.stepId]?.completed || 0;
+    // Check Dependency Logic
+    const availInput = calculateAvailableInput(selectedProject, form.stepId, stocks);
+    if (Number(form.quantity) > availInput && availInput !== Number.MAX_SAFE_INTEGER) {
+      if (!confirm(`Warning: You are recording ${form.quantity} but available input from previous step is only ${availInput}. Continue?`)) {
+        return;
+      }
+    }
+
+    const currentCompleted = selectedProject.progress?.[form.stepId]?.completed || 0;
     const newCompleted = currentCompleted + Number(form.quantity);
     
     // Calculate Duration
@@ -916,35 +933,30 @@ const RecordOutput = ({ user, setView }) => {
     try {
       const batch = writeBatch(db);
 
-      // 1. Update Project Progress
-      // FIX: Use simple prefixed collection
       const projectRef = doc(db, `${COL_PREFIX}projects`, form.projectId);
       batch.update(projectRef, {
         [`progress.${form.stepId}.completed`]: newCompleted,
         [`progress.${form.stepId}.lastUpdate`]: serverTimestamp()
       });
 
-      // 2. Increment Stock for future use
-      const stockKey = getStockId(project.type, form.stepId);
+      const stockKey = getStockId(selectedProject.type, form.stepId);
       const stockRef = doc(db, `${COL_PREFIX}step_stocks`, stockKey);
       batch.set(stockRef, { 
-        productType: project.type,
+        productType: selectedProject.type,
         stepId: form.stepId,
         quantity: increment(Number(form.quantity)), 
         lastUpdate: serverTimestamp() 
       }, { merge: true });
 
-      // 3. Add Production Log
       const logRef = doc(getColRef('daily_logs'));
       batch.set(logRef, {
         ...form,
-        projectName: project.name,
+        projectName: selectedProject.name,
         durationHours: duration.toFixed(2),
         date: new Date().toISOString().split('T')[0],
         timestamp: serverTimestamp()
       });
 
-      // 4. Update Worker Activity
       const batchDate = new Date().toISOString().split('T')[0];
       const stepName = availableSteps.find(s => s.id === form.stepId)?.name || form.stepId;
       
@@ -953,7 +965,7 @@ const RecordOutput = ({ user, setView }) => {
         batch.set(actRef, {
           workerId,
           projectId: form.projectId,
-          projectName: project.name,
+          projectName: selectedProject.name,
           stepId: form.stepId,
           stepName,
           date: batchDate,
@@ -967,7 +979,6 @@ const RecordOutput = ({ user, setView }) => {
       });
 
       await batch.commit();
-
       alert('Output Recorded & Stock Updated!');
       setView('dashboard');
     } catch (e) {
@@ -1157,7 +1168,6 @@ const SettingsScreen = ({ user }) => {
     
     try {
       if (existingId) {
-        // FIX: Use simple prefixed collection
         await updateDoc(doc(db, `${COL_PREFIX}parameters`, existingId), editForm);
       } else {
         await addDoc(getColRef('parameters'), editForm);
@@ -1347,15 +1357,26 @@ const ReferenceCalculator = ({ user }) => {
 
 const WorkerManager = ({ user }) => {
   const { data: workers } = useCollection('workers', user);
-  const [form, setForm] = useState({ name: '', type: 'Core', availability: ['Mon','Tue','Wed','Thu','Fri'] });
+  const [form, setForm] = useState({ name: '', type: 'Core', availability: ['Mon','Tue','Wed','Thu','Fri'], skills: [] });
+
+  const toggleSkill = (skill) => {
+    setForm(prev => {
+        const skills = prev.skills.includes(skill) 
+            ? prev.skills.filter(s => s !== skill)
+            : [...prev.skills, skill];
+        return { ...prev, skills };
+    });
+  };
 
   const addWorker = async (e) => {
     e.preventDefault();
     if(!form.name) return;
-    // FIX: Use simple prefixed collection
     await addDoc(getColRef('workers'), form);
-    setForm({...form, name: ''});
+    setForm({...form, name: '', skills: []});
   };
+
+  const availableSkills = ALL_STEPS_DEFINITIONS.map(s => s.name.split(' - ')[0]); // Simplified skill names
+  const uniqueSkills = [...new Set(availableSkills)];
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -1363,20 +1384,39 @@ const WorkerManager = ({ user }) => {
       
       <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
          <h3 className="font-bold mb-4">Add New Worker</h3>
-         <form onSubmit={addWorker} className="flex gap-4 items-end">
-           <div className="flex-1">
-             <label className="block text-xs font-bold text-slate-500 mb-1">Name</label>
-             <input type="text" value={form.name} onChange={e => setForm({...form, name: e.target.value})} className="w-full p-2 border rounded" placeholder="Name" />
+         <form onSubmit={addWorker} className="space-y-4">
+           <div className="flex gap-4 items-end">
+             <div className="flex-1">
+               <label className="block text-xs font-bold text-slate-500 mb-1">Name</label>
+               <input type="text" value={form.name} onChange={e => setForm({...form, name: e.target.value})} className="w-full p-2 border rounded" placeholder="Name" />
+             </div>
+             <div className="w-40">
+               <label className="block text-xs font-bold text-slate-500 mb-1">Type</label>
+               <select value={form.type} onChange={e => setForm({...form, type: e.target.value})} className="w-full p-2 border rounded">
+                 <option>Core</option>
+                 <option>Part-time</option>
+                 <option>Occasional</option>
+               </select>
+             </div>
            </div>
-           <div className="w-40">
-             <label className="block text-xs font-bold text-slate-500 mb-1">Type</label>
-             <select value={form.type} onChange={e => setForm({...form, type: e.target.value})} className="w-full p-2 border rounded">
-               <option>Core</option>
-               <option>Part-time</option>
-               <option>Occasional</option>
-             </select>
+           
+           <div>
+             <label className="block text-xs font-bold text-slate-500 mb-2">Skills (Optional - Unchecked means General)</label>
+             <div className="flex flex-wrap gap-2">
+                {uniqueSkills.map(skill => (
+                    <button 
+                        type="button"
+                        key={skill}
+                        onClick={() => toggleSkill(skill)}
+                        className={`text-xs px-3 py-1 rounded-full border ${form.skills.includes(skill) ? 'bg-cyan-600 text-white border-cyan-600' : 'bg-white text-slate-600 border-slate-200'}`}
+                    >
+                        {skill}
+                    </button>
+                ))}
+             </div>
            </div>
-           <button className="bg-cyan-600 text-white px-4 py-2 rounded hover:bg-cyan-700">Add</button>
+
+           <button className="w-full bg-cyan-600 text-white px-4 py-2 rounded hover:bg-cyan-700 font-bold">Add Worker</button>
          </form>
       </div>
 
@@ -1385,9 +1425,14 @@ const WorkerManager = ({ user }) => {
           <div key={w.id} className="bg-white p-4 rounded-xl border border-slate-200 flex justify-between items-center">
              <div>
                <div className="font-bold text-slate-800">{w.name}</div>
-               <div className="text-xs text-slate-400">{w.availability?.join(', ')}</div>
+               <div className="text-xs text-slate-400 mb-1">{w.type}</div>
+               <div className="flex flex-wrap gap-1">
+                 {(w.skills && w.skills.length > 0) ? w.skills.map(s => <span key={s} className="text-[10px] bg-slate-100 px-1 rounded">{s}</span>) : <span className="text-[10px] text-slate-300">General</span>}
+               </div>
              </div>
-             <span className="px-2 py-1 bg-slate-100 rounded text-xs text-slate-600">{w.type}</span>
+             <div className="text-right">
+                <span className="px-2 py-1 bg-emerald-50 text-emerald-600 rounded text-xs font-bold">ACTIVE</span>
+             </div>
           </div>
         ))}
       </div>
